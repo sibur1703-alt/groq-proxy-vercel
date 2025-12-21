@@ -1,6 +1,9 @@
 // api/groq-proxy-leads.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import Groq from 'groq-sdk';
+
+// Заглушки типов, чтобы не тянуть @vercel/node
+type VercelRequest = any;
+type VercelResponse = any;
 
 export const config = {
   runtime: 'nodejs',
@@ -78,14 +81,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const content = completion.choices[0]?.message?.content ?? '';
           console.log(`[${model}] SUCCESS`);
 
-          // Пытаемся распарсить JSON из content
+          // Пытаемся вытащить JSON из ответа
           let parsed: any = null;
           try {
             const jsonStart = content.indexOf('{');
             const jsonEnd = content.lastIndexOf('}');
-            const jsonSlice = jsonStart >= 0 && jsonEnd > jsonStart
-              ? content.slice(jsonStart, jsonEnd + 1)
-              : content;
+            const jsonSlice =
+              jsonStart >= 0 && jsonEnd > jsonStart
+                ? content.slice(jsonStart, jsonEnd + 1)
+                : content;
             parsed = JSON.parse(jsonSlice);
           } catch (e) {
             console.warn(`[${model}] JSON parse failed, raw content returned`);
