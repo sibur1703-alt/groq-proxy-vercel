@@ -1,7 +1,11 @@
 {
-  "version": 2,
-  "builds": [
-    { "src": "api/**/*.ts", "use": "@vercel/node" }
-  ],
-  "outputDirectory": "."
+  "name": "groq-proxy-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "echo \"no build step\""
+  },
+  "dependencies": {
+    "groq-sdk": "^0.6.0"
+  }
 }
