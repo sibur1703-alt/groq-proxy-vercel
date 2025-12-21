@@ -1,58 +1,85 @@
-// api/groq-proxy-leads.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node'
-import Groq from 'groq-sdk'
+import Groq from "groq-sdk";
 
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY })
+export const config = {
+  runtime: "edge",
+};
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
 const SYSTEM_PROMPT = `
-Ты - эксперт по поиску лидов (lead generation). Твоя задача - анализировать сообщения в чатах.
-Ищи сообщения, где автор явно ищет исполнителя, сотрудника или хочет заказать услугу.
+Ты — AI-фильтр для фрилансера (Python-разработчика). Твоя цель — найти ДЕНЬГИ.
+Анализируй сообщения из чатов и ищи ТОЛЬКО коммерческие заказы.
 
-Критерии ВАЖНОГО сообщения (Lead):
-1. Автор пишет "нужен программист", "ищу дизайнера", "куплю рекламу", "кто сделает лендинг" и т.п.
-2. Это НЕ реклама своих услуг этим же автором.
-3. Это НЕ вакансия от HR, а прямой заказчик или человек, который хочет себе кого-то.
-
-Верни ТОЛЬКО JSON вида:
+Твоя задача — классифицировать сообщение и вернуть JSON:
 {
-  "is_lead": true/false,
-  "summary": "кратко суть запроса",
-  "reason": "почему ты так решил"
+  "is_lead": boolean,
+  "summary": "краткая суть заказа (или причина отказа)",
+  "reason": "анализ: почему это лид или спам? (будь конкретен!)"
 }
-`
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+ПРАВИЛА ОТБОРА:
+✅ ЭТО ЛИД (is_lead = true):
+- Четкая потребность: "нужен бот", "ищу разработчика", "кто напишет парсер".
+- Готовность платить: "бюджет 50к", "сделаю заказ", "ищу исполнителя".
+- Срочность + задача: "нужно срочно поправить скрипт".
+- Неявные лиды: "кто может помочь с ботом (платно)?".
+
+❌ ЭТО МУСОР (is_lead = false):
+- Вопросы новичков: "как установить requests?", "почему ошибка 403?".
+- Короткие вопросы без контекста: "Пайтон?", "Есть кто живой?", "Java?".
+- Технические споры: "что лучше, Django или FastAPI?".
+- Поиск работы автором: "ищу заказы", "я разработчик".
+- Вакансии в офис/штат: "требуется Middle в офис", "ДМС, печеньки".
+- Реклама курсов/каналов.
+
+ПРИМЕРЫ REASON:
+- "Отказ: это технический вопрос по настройке сервера, а не заказ."
+- "Отказ: автор сам ищет работу (резюме)."
+- "Одобрено: явный запрос на разработку бота с упоминанием бюджета."
+- "Отказ: сообщение слишком короткое и не содержит задачи."
+`;
+
+export default async function handler(req) {
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "Only POST requests allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   try {
-    if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({ error: 'GROQ_API_KEY not set' })
-    }
+    const { text } = await req.json();
 
-    const { text } = req.body as { text?: string }
     if (!text) {
-      return res.status(400).json({ error: 'text is required' })
+      return new Response(JSON.stringify({ error: "No text provided" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    const completion = await client.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0,
-      response_format: { type: 'json_object' },
+    const completion = await groq.chat.completions.create({
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: text },
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: text },
       ],
-    })
+      model: "llama3-8b-8192",
+      temperature: 0,
+      response_format: { type: "json_object" },
+    });
 
-    const raw = completion.choices[0]?.message?.content || '{}'
-    let parsed: any
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      parsed = { is_lead: false, summary: 'parse_error', reason: raw.slice(0, 2000) }
-    }
+    const result = JSON.parse(completion.choices[0]?.message?.content || "{}");
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
 
-    return res.status(200).json(parsed)
-  } catch (e: any) {
-    console.error(e)
-    return res.status(500).json({ error: String(e?.message || e) })
+  } catch (error) {
+    console.error("Error processing request:", error);
+    return new Response(JSON.stringify({ error: "Internal Server Error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 }
