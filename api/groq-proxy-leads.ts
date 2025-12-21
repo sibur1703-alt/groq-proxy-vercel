@@ -12,15 +12,15 @@ const groq = new Groq({
 
 // Модели по приоритету: от самой умной к более дешёвым/безлимитным
 const MODEL_FALLBACKS = [
-  'llama-3.3-70b-versatile', // 100K токенов/сутки
-  'llama-3.1-8b-instant',    // 500K токенов/сутки
-  'allam-2-7b',              // 500K токенов/сутки
-  'groq/compound-mini',      // No limit, как последний шанс
+  'llama-3.3-70b-versatile', // 100K токенов/сутки [web:121][web:128]
+  'llama-3.1-8b-instant',    // 500K токенов/сутки [web:121]
+  'allam-2-7b',              // 500K токенов/сутки [web:121]
+  'groq/compound-mini',      // No limit (последний шанс) [web:121][web:130]
 ];
 
 const RETRIES_PER_MODEL = 2;
 
-// Твой системный промт можно оставить как есть
+// Твой системный промт (можешь подправить под себя)
 const SYSTEM_PROMPT = `
 Ты — AI-фильтр для фрилансера (Python‑разработчика). Твоя цель — найти ДЕНЬГИ.
 Анализируй сообщения из чатов и ищи ТОЛЬКО коммерческие заказы.
@@ -40,8 +40,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // Безопасно читаем тело
-    const body = typeof req.body === 'object' ? req.body : {};
+    // ВАЖНО: безопасно читаем тело, чтобы не было
+    // "Cannot destructure property 'text' of 'req.body' as it is undefined"
+    const body = typeof req.body === 'object' && req.body !== null ? req.body : {};
     const { text } = body as { text?: string };
 
     if (typeof text !== 'string' || !text.trim()) {
@@ -53,6 +54,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       { role: 'user' as const, content: text },
     ];
 
+    // Перебор моделей по приоритету
     for (const model of MODEL_FALLBACKS) {
       let lastError: any = null;
 
@@ -74,13 +76,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           });
         } catch (err: any) {
           lastError = err;
+
           const status = err.status ?? err.response?.status;
           const code =
             err.code ??
             err.response?.data?.error?.code ??
             err.response?.data?.error?.type;
 
-          // Лимит модели — сразу прыгаем на следующую
+          // 429 — выбит лимит модели, сразу идём к следующей
           if (status === 429 || code === 'rate_limit_exceeded') {
             console.warn(`Rate limit on model ${model}, switching fallback`, {
               status,
@@ -89,7 +92,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             break;
           }
 
-          // Временные 5xx — пробуем ретрай
+          // 5xx — пробуем ретрай на той же модели
           if (status >= 500 && status < 600 && attempt < RETRIES_PER_MODEL) {
             console.warn(
               `Server error on ${model}, retry ${attempt + 1}`,
@@ -99,6 +102,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             continue;
           }
 
+          // Остальные ошибки — считаем фатальными для этой модели
           console.error(`Error on model ${model}`, err);
           break;
         }
@@ -107,6 +111,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       console.warn(`Model ${model} failed, trying next fallback`);
     }
 
+    // Если ни одна модель не отдала ответ
     return res
       .status(503)
       .json({ ok: false, error: 'All Groq models failed or hit rate limits' });
