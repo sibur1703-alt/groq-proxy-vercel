@@ -3,7 +3,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import Groq from 'groq-sdk';
 
 export const config = {
-  runtime: 'edge',
+  runtime: 'nodejs',
 };
 
 const groq = new Groq({
