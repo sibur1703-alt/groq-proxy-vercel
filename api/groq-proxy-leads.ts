@@ -1,5 +1,4 @@
 // api/groq-proxy-leads.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import Groq from 'groq-sdk';
 
 export const config = {
