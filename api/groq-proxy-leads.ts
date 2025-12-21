@@ -12,10 +12,10 @@ const groq = new Groq({
 
 // Модели по приоритету: от самой умной к более дешёвым/безлимитным
 const MODEL_FALLBACKS = [
-  'llama-3.3-70b-versatile', // 100K токенов/сутки [web:121][web:128]
-  'llama-3.1-8b-instant',    // 500K токенов/сутки [web:121]
-  'allam-2-7b',              // 500K токенов/сутки [web:121]
-  'groq/compound-mini',      // No limit (последний шанс) [web:121][web:130]
+  'llama-3.3-70b-versatile', // 100K токенов/сутки
+  'llama-3.1-8b-instant',    // 500K токенов/сутки
+  'allam-2-7b',              // 500K токенов/сутки
+  'groq/compound-mini',      // No limit (последний шанс)
 ];
 
 const RETRIES_PER_MODEL = 2;
@@ -40,8 +40,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // ВАЖНО: безопасно читаем тело, чтобы не было
-    // "Cannot destructure property 'text' of 'req.body' as it is undefined"
+    // ВАЖНО: безопасно читаем тело
     const body = typeof req.body === 'object' && req.body !== null ? req.body : {};
     const { text } = body as { text?: string };
 
@@ -55,19 +54,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ];
 
     // Перебор моделей по приоритету
-    for (const model of MODEL_FALLBACKS) {
+    for (let modelIdx = 0; modelIdx < MODEL_FALLBACKS.length; modelIdx++) {
+      const model = MODEL_FALLBACKS[modelIdx];
       let lastError: any = null;
+
+      console.log(`[MODEL_TRY] Attempting model ${modelIdx + 1}/${MODEL_FALLBACKS.length}: ${model}`);
 
       for (let attempt = 0; attempt <= RETRIES_PER_MODEL; attempt++) {
         try {
+          console.log(`[${model}] Attempt ${attempt + 1}/${RETRIES_PER_MODEL + 1}`);
+
           const completion = await groq.chat.completions.create({
             model,
             messages,
             max_tokens: 512,
             temperature: 0.2,
-          }); // [web:125][web:132]
+          });
 
           const content = completion.choices[0]?.message?.content ?? '';
+
+          console.log(`[${model}] SUCCESS - returning response`);
 
           return res.status(200).json({
             ok: true,
@@ -82,41 +88,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             err.code ??
             err.response?.data?.error?.code ??
             err.response?.data?.error?.type;
+          const message = err.message ?? 'Unknown error';
 
-          // 429 — выбит лимит модели, сразу идём к следующей
+          // 429 — rate limit, выбит лимит модели
           if (status === 429 || code === 'rate_limit_exceeded') {
-            console.warn(`Rate limit on model ${model}, switching fallback`, {
+            console.warn(`[${model}] RATE_LIMIT (429) - switching to next model`, {
               status,
               code,
+              message,
             });
+            // Выходим из цикла ретраев и переходим к следующей модели
             break;
           }
 
-          // 5xx — пробуем ретрай на той же модели
+          // 5xx — server error, пробуем ретрай на той же модели
           if (status >= 500 && status < 600 && attempt < RETRIES_PER_MODEL) {
             console.warn(
-              `Server error on ${model}, retry ${attempt + 1}`,
-              err.message,
+              `[${model}] SERVER_ERROR (${status}) - retry ${attempt + 1}/${RETRIES_PER_MODEL}`,
+              message,
             );
             await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
-            continue;
+            continue; // Идём на следующую итерацию внутреннего цикла
           }
 
-          // Остальные ошибки — считаем фатальными для этой модели
-          console.error(`Error on model ${model}`, err);
-          break;
+          // Остальные ошибки (4xx, timeout и т.д.) — считаем фатальными
+          console.error(`[${model}] FATAL_ERROR (${status}) - moving to next model`, {
+            status,
+            code,
+            message,
+          });
+          break; // Выходим и переходим к следующей модели
         }
       }
 
-      console.warn(`Model ${model} failed, trying next fallback`);
+      // После выхода из цикла ретраев — если до сих пор нет ответа, логируем и идём на следующую
+      console.warn(
+        `[${model}] All attempts exhausted or rate limited, trying next fallback...`,
+      );
     }
 
-    // Если ни одна модель не отдала ответ
-    return res
-      .status(503)
-      .json({ ok: false, error: 'All Groq models failed or hit rate limits' });
+    // Если ни одна модель не отдала ответ после полного перебора
+    console.error('ALL_MODELS_FAILED - All Groq models exhausted');
+    return res.status(503).json({
+      ok: false,
+      error: 'All Groq models failed or hit rate limits',
+    });
   } catch (e: any) {
-    console.error('Fatal error in groq-proxy-leads handler', e);
+    console.error('FATAL_HANDLER_ERROR in groq-proxy-leads handler', e);
     return res.status(500).json({ ok: false, error: 'Internal Server Error' });
   }
 }
