@@ -1,5 +1,6 @@
 import Groq from 'groq-sdk';
 
+// Типы для Vercel (чтобы TypeScript не ругался)
 type VercelRequest = any;
 type VercelResponse = any;
 
@@ -7,140 +8,60 @@ export const config = {
   runtime: 'nodejs',
 };
 
-// ---------- GROQ КЛЮЧИ ----------
+// 1. ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ (РОТАЦИЯ КЛЮЧЕЙ)
+// Берем ключи из переменных окружения. Если ключа нет — он просто игнорируется.
 const groqKeys = [
-  process.env.GROQ_API_KEY_1!,
-  process.env.GROQ_API_KEY_2!,
-].filter(Boolean);
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+].filter((k): k is string => !!k && k.length > 0);
 
-const groqClients = groqKeys.map((key) => new Groq({ apiKey: key }));
+// Создаем пул клиентов Groq
+const groqClients = groqKeys.map((apiKey) => new Groq({ apiKey }));
 
-// ---------- CEREBRAS КЛЮЧИ ----------
-const cerebrasKeys = [
-  process.env.CEREBRAS_1!,
-  process.env.CEREBRAS_2!,
-].filter(Boolean);
-
-// Модели Groq по приоритету
-const GROQ_MODELS = [
-  'llama-3.3-70b-versatile',
-  'mixtral-8x7b-32768',
-];
-
-const RETRIES_PER_MODEL = 2;
-
-// ---- Жёсткие стоп-слова (мусор) ----
-const HARD_BLOCK_KEYWORDS = [
-  // крипта / схемы заработка
-  'заработок в сфере крипты',
-  'заработок в сфере криптовалют',
-  'крипта', 'crypto', 'биток', 'bitcoin', 'btc', 'usdt',
-  'доход от$100', 'доход от 100$', '1000$ в неделю',
-  'без левы', 'без левых сайтов', 'без обменников',
-  'наш интерес — 15%', 'наш интерес - 15%',
-  // дропы / банки
-  'дропы', 'дропов', 'дропа', 'дроппер',
-  'счета', 'счётов', 'счетов',
-  'vtbbank', 'vtb bank', 'sberbank', 'сбербанк', 'tinkoff', 'тинькофф',
-  // курьеры / общепит / офлайн
-  'курьер', 'курьеры', 'доставка еды', 'доставку еды',
-  'самокат', 'delivery club', 'доставщик', 'райдер',
-  'повар', 'официант', 'бармен', 'бариста',
-  'уборщиц', 'уборщица', 'уборщика',
-  'посудомойщ', 'посудниц',
-  'раннер', 'продавец', 'кассир', 'грузчик',
-  'coffee like', 'кофейня', 'ресторан', 'кафе',
-  // SMM / ассистенты / удалёнка без задачи
-  'smm', 'smmщик', 'сммщик',
-  'ассистент', 'помощник', 'личный помощник',
-  '#smm', '#помощник', '#ассистент',
-  'интересна удаленная деятельность',
-  'интересна удалённая деятельность',
-  'удалённая деятельность', 'удаленная деятельность',
-  'ищу ответственных людей', 'если хочется подробностей',
-  // биржи / псевдо-работа
-  'биржевых платформах', 'работы на биржевых платформах',
-];
-
-// глаголы найма (обязательное условие для лида)
-const LEAD_VERBS = ['ищу', 'нужен', 'нужна', 'нужны', 'требуется', 'возьму', 'нанять', 'найм'];
-
-// ------------- вспомогательные -------------
-
-function isHardBlocked(text: string): boolean {
-  const low = text.toLowerCase();
-  return HARD_BLOCK_KEYWORDS.some((kw) => low.includes(kw));
+if (groqClients.length === 0) {
+  console.error("NO GROQ API KEYS FOUND! CHECK .ENV");
 }
 
-function hasLeadVerb(text: string): boolean {
-  const low = text.toLowerCase();
-  return LEAD_VERBS.some((v) => low.includes(v));
-}
+// 2. СПИСОК МОДЕЛЕЙ (ОТ УМНЫХ К БЫСТРЫМ)
+const MODEL_FALLBACKS = [
+  'llama-3.3-70b-versatile', // Топ-1: Умная, понимает контекст (Лимит: ~100k токенов)
+  'qwen/qwen-2.5-32b',       // Топ-2: Отличная альтернатива, строгая (Лимит: ~500k токенов)
+  'llama-3.1-8b-instant',    // Топ-3: Резерв, очень быстрая (Лимит: ~500k токенов)
+];
 
+const RETRIES_PER_MODEL = 2; // Сколько раз долбить одну модель, если она упала (500/503)
+
+// 3. СТРОГИЙ СИСТЕМНЫЙ ПРОМТ (FEW-SHOT)
 const SYSTEM_PROMPT = `
-Твоя роль: Жесткий фильтр спама и флуда.
+Твоя роль: Жесткий фильтр спама и флуда для IT-чатов.
+Твоя задача: Вернуть JSON {"is_lead": boolean, "reason": string}.
 
-Твоя задача: Найти сообщения, где автор ЯВНО хочет НАНЯТЬ ИТ-СПЕЦИАЛИСТА
-(программиста, разработчика ботов/парсеров, аналитика, дизайнера, админа и т.п.) за ДЕНЬГИ.
+СТАВЬ "is_lead": true ТОЛЬКО ЕСЛИ:
+1. Автор ЯВНО ищет исполнителя ("ищу кодера", "нужен бот", "кто сделает").
+2. Автор ГОТОВ ПЛАТИТЬ (это коммерческий заказ, а не просьба помочь бесплатно).
 
-Сообщения про:
-- крипту, быстрый заработок, доход без навыков;
-- курьеров, официантов, бариста, продавцов, уборщиц, любую офлайн-работу;
-- SMM, личных помощников, ассистентов, операторов чата;
-- «удалённую деятельность» без описания конкретной ИТ-задачи
-ВСЕГДА is_lead = false.
+СТАВЬ "is_lead": false (ЭТО ВАЖНО!):
+- Если это просто вопрос ("как сделать?", "почему ошибка?").
+- Если это реклама СВОИХ услуг ("сделаю ботов", "пишем сайты").
+- Если это болтовня, ответы, приветствия ("спасибо", "актуально?", "в лс").
+- Если текст короче 3 слов и без контекста ("цена", "еще").
 
-Если в сообщении НЕТ слов "ищу", "нужен/нужна/нужны", "требуется", "нанять" —
-это почти всегда не запрос на найм → is_lead = false.
-
-Примеры:
-- "СРОЧНО нужны курьеры" -> false (курьеры, не IT)
-- "Предлагаем заработок в сфере крипты" -> false (крипта)
-- "Ищу ответственных людей для удалённой деятельности" -> false (нет задачи)
-- "Ищем разработчика на одну задачу..." -> true (найм разработчика)
-- "Ищу специалиста для исправления проблем с капчей в скриптах" -> true (конкретная тех. задача)
-
-Верни JSON: {"is_lead": boolean}
+ПРИМЕРЫ:
+User: "Еще..." -> false (Мусор)
+User: "Чем на русском..." -> false (Мусор)
+User: "Нужен парсер, бюджет 5к" -> true (Заказ)
+User: "Я пишу ботов, кому надо?" -> false (Реклама услуг, не заказчик)
+User: "Помогите с ошибкой в питоне" -> false (Технический вопрос)
 `.trim();
 
-async function callGroq(client: Groq, model: string, messages: any[]) {
-  return client.chat.completions.create({
-    model,
-    messages,
-    max_tokens: 50,
-    temperature: 0,
-    response_format: { type: 'json_object' },
-  });
-}
+// 4. БЫСТРЫЙ ФИЛЬТР СТОП-СЛОВ (БЕЗ AI)
+// Если сообщение состоит только из этих слов (или очень короткое с ними) — сразу в мусор.
+const INSTANT_BLOCK_REGEX = /^(привет|ку|цена\??|актуально\??|спс|спасибо|помогите|как|почему|здравствуйте)$/i;
 
-async function callCerebras(key: string, messages: any[]) {
-  const resp = await fetch('https://api.cerebras.ai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b',
-      messages,
-      max_tokens: 50,
-      temperature: 0,
-      response_format: { type: 'json_object' },
-    }),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Cerebras HTTP ${resp.status}: ${text}`);
-  }
-
-  return resp.json();
-}
-
-// ----------------- handler -----------------
-
+// --- ОСНОВНОЙ ХЕНДЛЕР ---
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
+    // Разрешаем только POST
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed' });
     }
@@ -148,90 +69,102 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const body = (typeof req.body === 'object' && req.body !== null) ? req.body : {};
     const { text } = body as { text?: string };
 
+    // --- ЭТАП 1: ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА (БЕЗ ТРАТЫ ТОКЕНОВ) ---
     if (typeof text !== 'string' || !text.trim()) {
-      return res.status(200).json({ ok: true, is_lead: false, text: '' });
+       return res.status(200).json({ ok: true, is_lead: false, reason: 'Empty text' });
     }
 
     const cleanText = text.trim();
 
-    // 1) короткий мусор
+    // Фильтр длины: < 15 символов — считаем мусором (фразы "Нужен бот" обычно длиннее)
     if (cleanText.length < 15) {
-      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
+      return res.status(200).json({
+        ok: true,
+        is_lead: false,
+        reason: 'Text too short (<15 chars), likely spam/chat',
+      });
     }
 
-    // 2) жёсткий блок по тематикам
-    if (isHardBlocked(cleanText)) {
-      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
+    // Фильтр стоп-слов (для коротких фраз до 30 символов)
+    if (cleanText.length < 30 && INSTANT_BLOCK_REGEX.test(cleanText.split(' ')[0])) {
+         return res.status(200).json({
+            ok: true,
+            is_lead: false,
+            reason: 'Stop-word filter triggered',
+        });
     }
 
-    // 3) если нет глагола найма — не лид
-    if (!hasLeadVerb(cleanText)) {
-      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
-    }
-
+    // --- ЭТАП 2: ЗАПРОС К НЕЙРОСЕТЯМ (С РОТАЦИЕЙ) ---
     const messages = [
       { role: 'system' as const, content: SYSTEM_PROMPT },
       { role: 'user' as const, content: cleanText },
     ];
 
-    // -------- 1. GROQ: два ключа × модели --------
-    for (let cIdx = 0; cIdx < groqClients.length; cIdx++) {
-      const client = groqClients[cIdx];
+    let lastError = null;
 
-      for (let mIdx = 0; mIdx < GROQ_MODELS.length; mIdx++) {
-        const model = GROQ_MODELS[mIdx];
+    // Перебираем модели по очереди
+    for (const model of MODEL_FALLBACKS) {
+      // Выбираем случайный ключ API для балансировки (Load Balancing)
+      const randomClientIdx = Math.floor(Math.random() * groqClients.length);
+      const groq = groqClients[randomClientIdx]; 
+      
+      // Пробуем несколько раз одну модель (на случай сетевого сбоя)
+      for (let attempt = 0; attempt <= RETRIES_PER_MODEL; attempt++) {
+        try {
+          const completion = await groq.chat.completions.create({
+            model: model,
+            messages,
+            max_tokens: 100, // Нам нужен только JSON, 100 токенов за глаза
+            temperature: 0,   // Строгий детерминизм (без креатива)
+            response_format: { type: 'json_object' } // Гарантируем JSON на выходе
+          });
 
-        for (let attempt = 0; attempt <= RETRIES_PER_MODEL; attempt++) {
-          try {
-            const completion = await callGroq(client, model, messages);
-            const content = completion.choices[0]?.message?.content ?? '';
-            const parsed = JSON.parse(content);
+          const content = completion.choices[0]?.message?.content ?? '';
+          
+          // Парсим ответ
+          const parsed = JSON.parse(content);
 
-            return res.status(200).json({
-              ok: true,
-              model,
-              is_lead: Boolean(parsed.is_lead),
-              text: cleanText,
-            });
-          } catch (err: any) {
-            const msg = err?.message || String(err);
-            console.warn(`[GROQ ${cIdx + 1} ${model}] fail #${attempt + 1}:`, msg);
+          // УСПЕХ! Возвращаем результат
+          return res.status(200).json({
+            ok: true,
+            model: model, // Полезно знать, какая модель сработала
+            is_lead: Boolean(parsed.is_lead),
+            reason: String(parsed.reason || 'No reason'),
+          });
 
-            if (attempt === RETRIES_PER_MODEL) break;
-            await new Promise((r) => setTimeout(r, 800));
+        } catch (err: any) {
+          lastError = err;
+          const status = err.status ?? err.response?.status;
+          
+          console.warn(`[${model}] Attempt ${attempt} failed: ${err.message}`);
+
+          // Если ошибка 429 (Rate Limit) — СРАЗУ меняем модель, не делаем retries
+          if (status === 429 || err.code === 'rate_limit_exceeded') {
+            break; 
           }
+          
+          // Если 500/503 (Сервер упал) — ждем и пробуем еще раз
+          if (status >= 500 && attempt < RETRIES_PER_MODEL) {
+            await new Promise((r) => setTimeout(r, 800)); // Пауза 0.8 сек
+            continue;
+          }
+          
+          // Другие ошибки — меняем модель
+          break;
         }
       }
     }
 
-    // -------- 2. CEREBRAS: два ключа по очереди --------
-    for (let idx = 0; idx < cerebrasKeys.length; idx++) {
-      const key = cerebrasKeys[idx];
-      if (!key) continue;
-
-      try {
-        const result = await callCerebras(key, messages);
-        const content = result.choices?.[0]?.message?.content ?? '';
-        const parsed = JSON.parse(content);
-
-        return res.status(200).json({
-          ok: true,
-          model: `cerebras-llama-3.3-70b-${idx + 1}`,
-          is_lead: Boolean(parsed.is_lead),
-          text: cleanText,
-        });
-      } catch (err: any) {
-        console.error(`[CEREBRAS ${idx + 1}] failed:`, err?.message || String(err));
-        continue;
-      }
-    }
-
+    // --- ЭТАП 3: ЕСЛИ ВСЕ УМЕРЛО ---
+    console.error('ALL_MODELS_FAILED', lastError);
     return res.status(503).json({
       ok: false,
-      error: 'All providers failed',
+      error: 'All AI models failed',
+      details: lastError?.message,
     });
+
   } catch (e: any) {
-    console.error('FATAL_HANDLER_ERROR:', e);
+    console.error('FATAL_HANDLER_ERROR', e);
     return res.status(500).json({ ok: false, error: 'Internal Server Error' });
   }
 }
