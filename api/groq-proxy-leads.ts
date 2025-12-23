@@ -29,23 +29,79 @@ const GROQ_MODELS = [
 
 const RETRIES_PER_MODEL = 2;
 
+// ---- Жёсткие стоп-слова (мусор) ----
+const HARD_BLOCK_KEYWORDS = [
+  // крипта / схемы заработка
+  'заработок в сфере крипты',
+  'заработок в сфере криптовалют',
+  'крипта', 'crypto', 'биток', 'bitcoin', 'btc', 'usdt',
+  'доход от$100', 'доход от 100$', '1000$ в неделю',
+  'без левы', 'без левых сайтов', 'без обменников',
+  'наш интерес — 15%', 'наш интерес - 15%',
+  // дропы / банки
+  'дропы', 'дропов', 'дропа', 'дроппер',
+  'счета', 'счётов', 'счетов',
+  'vtbbank', 'vtb bank', 'sberbank', 'сбербанк', 'tinkoff', 'тинькофф',
+  // курьеры / общепит / офлайн
+  'курьер', 'курьеры', 'доставка еды', 'доставку еды',
+  'самокат', 'delivery club', 'доставщик', 'райдер',
+  'повар', 'официант', 'бармен', 'бариста',
+  'уборщиц', 'уборщица', 'уборщика',
+  'посудомойщ', 'посудниц',
+  'раннер', 'продавец', 'кассир', 'грузчик',
+  'coffee like', 'кофейня', 'ресторан', 'кафе',
+  // SMM / ассистенты / удалёнка без задачи
+  'smm', 'smmщик', 'сммщик',
+  'ассистент', 'помощник', 'личный помощник',
+  '#smm', '#помощник', '#ассистент',
+  'интересна удаленная деятельность',
+  'интересна удалённая деятельность',
+  'удалённая деятельность', 'удаленная деятельность',
+  'ищу ответственных людей', 'если хочется подробностей',
+  // биржи / псевдо-работа
+  'биржевых платформах', 'работы на биржевых платформах',
+];
+
+// глаголы найма (обязательное условие для лида)
+const LEAD_VERBS = ['ищу', 'нужен', 'нужна', 'нужны', 'требуется', 'возьму', 'нанять', 'найм'];
+
+// ------------- вспомогательные -------------
+
+function isHardBlocked(text: string): boolean {
+  const low = text.toLowerCase();
+  return HARD_BLOCK_KEYWORDS.some((kw) => low.includes(kw));
+}
+
+function hasLeadVerb(text: string): boolean {
+  const low = text.toLowerCase();
+  return LEAD_VERBS.some((v) => low.includes(v));
+}
+
 const SYSTEM_PROMPT = `
 Твоя роль: Жесткий фильтр спама и флуда.
-Твоя задача: Найти сообщения, где автор ЯВНО хочет НАНЯТЬ специалиста за ДЕНЬГИ.
 
-Правило: Если есть сомнения -> "is_lead": false.
+Твоя задача: Найти сообщения, где автор ЯВНО хочет НАНЯТЬ ИТ-СПЕЦИАЛИСТА
+(программиста, разработчика ботов/парсеров, аналитика, дизайнера, админа и т.п.) за ДЕНЬГИ.
 
-ПРИМЕРЫ:
-- "Еще..." -> false
-- "Чем на русском..." -> false
-- "А данные самое важное..." -> false
-- "Нужен бот, пишите" -> true
-- "Ищу разработчика, плачу" -> true
+Сообщения про:
+- крипту, быстрый заработок, доход без навыков;
+- курьеров, официантов, бариста, продавцов, уборщиц, любую офлайн-работу;
+- SMM, личных помощников, ассистентов, операторов чата;
+- «удалённую деятельность» без описания конкретной ИТ-задачи
+ВСЕГДА is_lead = false.
+
+Если в сообщении НЕТ слов "ищу", "нужен/нужна/нужны", "требуется", "нанять" —
+это почти всегда не запрос на найм → is_lead = false.
+
+Примеры:
+- "СРОЧНО нужны курьеры" -> false (курьеры, не IT)
+- "Предлагаем заработок в сфере крипты" -> false (крипта)
+- "Ищу ответственных людей для удалённой деятельности" -> false (нет задачи)
+- "Ищем разработчика на одну задачу..." -> true (найм разработчика)
+- "Ищу специалиста для исправления проблем с капчей в скриптах" -> true (конкретная тех. задача)
 
 Верни JSON: {"is_lead": boolean}
 `.trim();
-
-// ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 
 async function callGroq(client: Groq, model: string, messages: any[]) {
   return client.chat.completions.create({
@@ -81,7 +137,7 @@ async function callCerebras(key: string, messages: any[]) {
   return resp.json();
 }
 
-// ---------- ХЭНДЛЕР ----------
+// ----------------- handler -----------------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -98,13 +154,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const cleanText = text.trim();
 
-    // короткий мусор
+    // 1) короткий мусор
     if (cleanText.length < 15) {
-      return res.status(200).json({
-        ok: true,
-        is_lead: false,
-        text: cleanText,
-      });
+      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
+    }
+
+    // 2) жёсткий блок по тематикам
+    if (isHardBlocked(cleanText)) {
+      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
+    }
+
+    // 3) если нет глагола найма — не лид
+    if (!hasLeadVerb(cleanText)) {
+      return res.status(200).json({ ok: true, is_lead: false, text: cleanText });
     }
 
     const messages = [
@@ -112,7 +174,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       { role: 'user' as const, content: cleanText },
     ];
 
-    // ----- 1. GROQ: два ключа × модели -----
+    // -------- 1. GROQ: два ключа × модели --------
     for (let cIdx = 0; cIdx < groqClients.length; cIdx++) {
       const client = groqClients[cIdx];
 
@@ -142,7 +204,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // ----- 2. CEREBRAS: два ключа по очереди -----
+    // -------- 2. CEREBRAS: два ключа по очереди --------
     for (let idx = 0; idx < cerebrasKeys.length; idx++) {
       const key = cerebrasKeys[idx];
       if (!key) continue;
