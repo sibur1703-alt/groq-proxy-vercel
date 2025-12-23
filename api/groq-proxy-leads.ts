@@ -7,20 +7,24 @@ export const config = {
   runtime: 'nodejs',
 };
 
+// ---------- GROQ КЛЮЧИ ----------
 const groqKeys = [
   process.env.GROQ_API_KEY_1!,
   process.env.GROQ_API_KEY_2!,
 ].filter(Boolean);
 
-const groqClients = groqKeys.map(key => new Groq({ apiKey: key }));
+const groqClients = groqKeys.map((key) => new Groq({ apiKey: key }));
 
-// DeepSeek — бесплатный + мощный для классификации
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY!;
+// ---------- CEREBRAS КЛЮЧИ ----------
+const cerebrasKeys = [
+  process.env.CEREBRAS_1!,
+  process.env.CEREBRAS_2!,
+].filter(Boolean);
 
-const MODEL_FALLBACKS = [
-  'llama-3.3-70b-versatile', // Groq топ
-  'mixtral-8x7b-32768',      // Groq резерв
-  'deepseek/deepseek-chat',  // Бесплатный зверь
+// Модели Groq по приоритету
+const GROQ_MODELS = [
+  'llama-3.3-70b-versatile',
+  'mixtral-8x7b-32768',
 ];
 
 const RETRIES_PER_MODEL = 2;
@@ -31,43 +35,53 @@ const SYSTEM_PROMPT = `
 
 Правило: Если есть сомнения -> "is_lead": false.
 
-ПРИМЕРЫ (ОБУЧЕНИЕ):
-- "Еще..." -> false (Мусор)
-- "Чем на русском..." -> false (Мусор)
-- "А данные самое важное..." -> false (Мусор, просто мнение)
-- "Нужен бот, пишите" -> true (Заказ)
-- "Ищу разработчика, плачу" -> true (Заказ)
+ПРИМЕРЫ:
+- "Еще..." -> false
+- "Чем на русском..." -> false
+- "А данные самое важное..." -> false
+- "Нужен бот, пишите" -> true
+- "Ищу разработчика, плачу" -> true
 
-Верни JSON: {"is_lead": boolean, "reason": string}
+Верни JSON: {"is_lead": boolean}
 `.trim();
+
+// ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 
 async function callGroq(client: Groq, model: string, messages: any[]) {
   return client.chat.completions.create({
     model,
     messages,
-    max_tokens: 100,
+    max_tokens: 50,
     temperature: 0,
-    response_format: { type: 'json_object' }
+    response_format: { type: 'json_object' },
   });
 }
 
-async function callDeepSeek(messages: any[]) {
-  const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+async function callCerebras(key: string, messages: any[]) {
+  const resp = await fetch('https://api.cerebras.ai/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${DEEPSEEK_KEY}`,
+      Authorization: `Bearer ${key}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'deepseek-chat',
+      model: 'llama-3.3-70b',
       messages,
-      max_tokens: 100,
+      max_tokens: 50,
       temperature: 0,
-      response_format: { type: 'json_object' }
-    })
+      response_format: { type: 'json_object' },
+    }),
   });
-  return response.json();
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Cerebras HTTP ${resp.status}: ${text}`);
+  }
+
+  return resp.json();
 }
+
+// ---------- ХЭНДЛЕР ----------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -79,15 +93,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const { text } = body as { text?: string };
 
     if (typeof text !== 'string' || !text.trim()) {
-      return res.status(200).json({ ok: true, is_lead: false, reason: 'Empty' });
+      return res.status(200).json({ ok: true, is_lead: false, text: '' });
     }
-    
+
     const cleanText = text.trim();
+
+    // короткий мусор
     if (cleanText.length < 15) {
       return res.status(200).json({
         ok: true,
         is_lead: false,
-        reason: 'Text too short (<15 chars)',
+        text: cleanText,
       });
     }
 
@@ -96,61 +112,64 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       { role: 'user' as const, content: cleanText },
     ];
 
-    // 1. Пробуем все Groq ключи + модели
-    for (let clientIdx = 0; clientIdx < groqClients.length; clientIdx++) {
-      const client = groqClients[clientIdx];
-      console.log(`[Groq ${clientIdx + 1}] Trying models...`);
-      
-      for (let modelIdx = 0; modelIdx < MODEL_FALLBACKS.length - 1; modelIdx++) { // -1 исключает DeepSeek
-        const model = MODEL_FALLBACKS[modelIdx];
-        
+    // ----- 1. GROQ: два ключа × модели -----
+    for (let cIdx = 0; cIdx < groqClients.length; cIdx++) {
+      const client = groqClients[cIdx];
+
+      for (let mIdx = 0; mIdx < GROQ_MODELS.length; mIdx++) {
+        const model = GROQ_MODELS[mIdx];
+
         for (let attempt = 0; attempt <= RETRIES_PER_MODEL; attempt++) {
           try {
             const completion = await callGroq(client, model, messages);
             const content = completion.choices[0]?.message?.content ?? '';
             const parsed = JSON.parse(content);
 
-            console.log(`[${model}] SUCCESS`);
             return res.status(200).json({
               ok: true,
               model,
               is_lead: Boolean(parsed.is_lead),
-              reason: String(parsed.reason ?? ''),
+              text: cleanText,
             });
           } catch (err: any) {
-            console.log(`[${model}] attempt ${attempt + 1} failed:`, err.message);
+            const msg = err?.message || String(err);
+            console.warn(`[GROQ ${cIdx + 1} ${model}] fail #${attempt + 1}:`, msg);
+
             if (attempt === RETRIES_PER_MODEL) break;
-            await new Promise(r => setTimeout(r, 1000)); // 1s backoff
+            await new Promise((r) => setTimeout(r, 800));
           }
         }
       }
     }
 
-    // 2. Финальный фоллбэк: DeepSeek (бесплатный)
-    console.log('[DeepSeek] Final fallback...');
-    try {
-      const deepseekResult = await callDeepSeek(messages);
-      const content = deepseekResult.choices[0]?.message?.content ?? '';
-      const parsed = JSON.parse(content);
+    // ----- 2. CEREBRAS: два ключа по очереди -----
+    for (let idx = 0; idx < cerebrasKeys.length; idx++) {
+      const key = cerebrasKeys[idx];
+      if (!key) continue;
 
-      console.log('[deepseek-chat] SUCCESS');
-      return res.status(200).json({
-        ok: true,
-        model: 'deepseek-chat',
-        is_lead: Boolean(parsed.is_lead),
-        reason: String(parsed.reason ?? ''),
-      });
-    } catch (err: any) {
-      console.error('[DeepSeek] FAILED:', err.message);
+      try {
+        const result = await callCerebras(key, messages);
+        const content = result.choices?.[0]?.message?.content ?? '';
+        const parsed = JSON.parse(content);
+
+        return res.status(200).json({
+          ok: true,
+          model: `cerebras-llama-3.3-70b-${idx + 1}`,
+          is_lead: Boolean(parsed.is_lead),
+          text: cleanText,
+        });
+      } catch (err: any) {
+        console.error(`[CEREBRAS ${idx + 1}] failed:`, err?.message || String(err));
+        continue;
+      }
     }
 
-    return res.status(503).json({ 
-      ok: false, 
-      error: 'All models exhausted' 
+    return res.status(503).json({
+      ok: false,
+      error: 'All providers failed',
     });
-
   } catch (e: any) {
     console.error('FATAL_HANDLER_ERROR:', e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ ok: false, error: 'Internal Server Error' });
   }
 }
